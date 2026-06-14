@@ -1,15 +1,4 @@
-package openf1
-
-import (
-	"context"
-	"net/url"
-	"strings"
-
-	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/any-cli/kit/errs"
-)
-
-// domain.go exposes openf1 as a kit Domain: a driver that a multi-domain
+// domain.go exposes OpenF1 as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/openf1-cli/openf1"
@@ -19,9 +8,15 @@ import (
 // openf1:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone openf1 binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+package openf1
+
+import (
+	"context"
+
+	"github.com/tamnd/any-cli/kit"
+	"github.com/tamnd/any-cli/kit/errs"
+)
+
 func init() { kit.Register(Domain{}) }
 
 // Domain is the openf1 driver. It carries no state; the per-run client is
@@ -36,105 +31,249 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "openf1",
-			Short:  "A command line for openf1.",
-			Long: `A command line for openf1.
+			Short:  "Formula 1 timing and session data from OpenF1",
+			Long: `openf1 reads Formula 1 live timing and historical session data
+from the OpenF1 public API (api.openf1.org/v1). No API key required.
 
-openf1 reads public openf1 data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+Commands cover sessions, race weekends, drivers, lap timing, tyre stints,
+pit stops, and race control messages.`,
+			Site: "https://" + Host,
 			Repo: "https://github.com/tamnd/openf1-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every OpenF1 operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `openf1 page` and
-	// `ant get openf1://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name: "sessions", Group: "read",
+		Summary: "List F1 sessions (Race, Qualifying, Sprint, etc.)",
+	}, listSessions)
 
-	// List op: members of a page, the home of `openf1 links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// openf1://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name: "meetings", Group: "read",
+		Summary: "List F1 race weekends",
+	}, listMeetings)
 
-	// Search op: a free-text query, the home of `openf1 search` and the
-	// search box a host (ant) shows for this domain. A top-level op named "search"
-	// is exactly what kit.Host.Searchable looks for. Like links it emits page
-	// stubs, so a host can follow any hit to its own openf1://page/ URI.
-	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read",
-		Summary: "Search openf1",
-		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, searchPages)
+	kit.Handle(app, kit.OpMeta{
+		Name: "drivers", Group: "read",
+		Summary: "List drivers in a session",
+	}, listDrivers)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "laps", Group: "read",
+		Summary: "List lap timing data for a session",
+	}, listLaps)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "stints", Group: "read",
+		Summary: "List tyre stint data for a session",
+	}, listStints)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "pit", Group: "read",
+		Summary: "List pit stop data for a session",
+	}, listPit)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "racecontrol", Group: "read",
+		Summary: "List race control messages for a session",
+	}, listRaceControl)
 }
 
 // newClient builds the client from the host-resolved config, so a host and the
 // standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientConfig(dcfg), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type sessionsInput struct {
+	Year        int     `kit:"flag" help:"filter by year (e.g. 2024)"`
+	SessionName string  `kit:"flag,name=session-name" help:"filter by session name (Race, Qualifying, Sprint)"`
+	Circuit     string  `kit:"flag" help:"filter by circuit short name"`
+	Limit       int     `kit:"flag,inherit" help:"max results"`
+	Client      *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type meetingsInput struct {
+	Year   int     `kit:"flag" help:"filter by year (e.g. 2024)"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-type searchRef struct {
-	Query  string  `kit:"arg" help:"search query"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type driversInput struct {
+	SessionKey int     `kit:"flag,name=session-key" help:"session key (required)"`
+	Driver     int     `kit:"flag" help:"filter by driver number"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
+}
+
+type lapsInput struct {
+	SessionKey int     `kit:"flag,name=session-key" help:"session key (required)"`
+	Driver     int     `kit:"flag" help:"filter by driver number"`
+	Lap        int     `kit:"flag" help:"filter by lap number"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
+}
+
+type stintsInput struct {
+	SessionKey int     `kit:"flag,name=session-key" help:"session key (required)"`
+	Driver     int     `kit:"flag" help:"filter by driver number"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
+}
+
+type pitInput struct {
+	SessionKey int     `kit:"flag,name=session-key" help:"session key (required)"`
+	Driver     int     `kit:"flag" help:"filter by driver number"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
+}
+
+type raceControlInput struct {
+	SessionKey int     `kit:"flag,name=session-key" help:"session key (required)"`
+	Flag       string  `kit:"flag" help:"filter by flag (YELLOW, RED, SAFETY CAR, etc.)"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Client     *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listSessions(ctx context.Context, in sessionsInput, emit func(Session) error) error {
+	results, err := in.Client.GetSessions(ctx, SessionFilter{
+		Year:        in.Year,
+		SessionName: in.SessionName,
+		Circuit:     in.Circuit,
+	})
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
+	for i, s := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func listMeetings(ctx context.Context, in meetingsInput, emit func(Meeting) error) error {
+	results, err := in.Client.GetMeetings(ctx, MeetingFilter{Year: in.Year})
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
+	for i, m := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listDrivers(ctx context.Context, in driversInput, emit func(Driver) error) error {
+	if in.SessionKey == 0 {
+		return errs.Usage("--session-key is required for drivers")
+	}
+	results, err := in.Client.GetDrivers(ctx, DriverFilter{
+		SessionKey:   in.SessionKey,
+		DriverNumber: in.Driver,
+	})
+	if err != nil {
+		return err
+	}
+	for i, d := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listLaps(ctx context.Context, in lapsInput, emit func(Lap) error) error {
+	if in.SessionKey == 0 {
+		return errs.Usage("--session-key is required for laps")
+	}
+	results, err := in.Client.GetLaps(ctx, LapFilter{
+		SessionKey:   in.SessionKey,
+		DriverNumber: in.Driver,
+		LapNumber:    in.Lap,
+	})
+	if err != nil {
+		return err
+	}
+	for i, l := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listStints(ctx context.Context, in stintsInput, emit func(Stint) error) error {
+	if in.SessionKey == 0 {
+		return errs.Usage("--session-key is required for stints")
+	}
+	results, err := in.Client.GetStints(ctx, StintFilter{
+		SessionKey:   in.SessionKey,
+		DriverNumber: in.Driver,
+	})
+	if err != nil {
+		return err
+	}
+	for i, s := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listPit(ctx context.Context, in pitInput, emit func(PitStop) error) error {
+	if in.SessionKey == 0 {
+		return errs.Usage("--session-key is required for pit")
+	}
+	results, err := in.Client.GetPit(ctx, PitFilter{
+		SessionKey:   in.SessionKey,
+		DriverNumber: in.Driver,
+	})
+	if err != nil {
+		return err
+	}
+	for i, p := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -142,59 +281,37 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-func searchPages(ctx context.Context, in searchRef, emit func(*Page) error) error {
-	pages, err := in.Client.Search(ctx, in.Query, in.Limit)
-	if err != nil {
-		return mapErr(err)
+func listRaceControl(ctx context.Context, in raceControlInput, emit func(RaceControlMsg) error) error {
+	if in.SessionKey == 0 {
+		return errs.Usage("--session-key is required for racecontrol")
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	results, err := in.Client.GetRaceControl(ctx, RaceControlFilter{
+		SessionKey: in.SessionKey,
+		Flag:       in.Flag,
+	})
+	if err != nil {
+		return err
+	}
+	for i, m := range results {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(m); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// --- Resolver: the URI-native string functions ---
 
-// Classify turns any accepted input — a bare path or a full openf1.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify is not deeply meaningful for an API-only domain with no browsable
+// page hierarchy, so we return an error to signal this domain is query-driven.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized openf1 reference: %q", input)
-	}
-	return "page", id, nil
+	return "", "", errs.Usage("openf1 is a query-driven domain; use commands like `openf1 sessions` or `openf1 drivers`")
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns an error since OpenF1 sessions are not web-browsable pages.
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("openf1 has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	return "", errs.Usage("openf1 has no web resource type %q", uriType)
 }

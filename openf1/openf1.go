@@ -1,63 +1,80 @@
 // Package openf1 is the library behind the openf1 command line:
-// the HTTP client, request shaping, and the typed data models for openf1.
+// the HTTP client, request shaping, and the typed data models for the OpenF1
+// API (api.openf1.org/v1).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// OpenF1 is a free, open-source API providing Formula 1 live timing and
+// historical session data. No API key required. Data includes sessions,
+// meetings, drivers, lap timing, stints, pit stops, race control messages,
+// and telemetry.
 package openf1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strings"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to openf1. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "openf1/dev (+https://github.com/tamnd/openf1-cli)"
+// Host is the API host this client talks to.
+const Host = "api.openf1.org"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at openf1.com; change it once you
-// know the real endpoints you want to read.
-const Host = "openf1.com"
+// BaseURL is the API base URL.
+const BaseURL = "https://api.openf1.org/v1"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to openf1 over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: "openf1-cli/0.1 (tamnd87@gmail.com)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
+// Client talks to the OpenF1 API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with the default config.
+func NewClient() *Client {
+	cfg := DefaultConfig()
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// NewClientConfig returns a Client configured with cfg.
+func NewClientConfig(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// get fetches rawURL and returns the body bytes with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -83,9 +100,10 @@ func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -107,10 +125,12 @@ func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -124,110 +144,209 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on openf1.com. It is a stand-in for the typed records you
-// will model from the real openf1 endpoints.
-//
-// The kit struct tags make it addressable as a resource URI (see domain.go): ID
-// is the URI id, and Body is the long text `openf1 cat` and the Markdown
-// export print. The table tags shape the terminal grid (`-o table`) without
-// touching the JSON: URL is flagged the canonical column the `url` format prints,
-// and Body is hidden from the grid with `table:"-"` because a long preview wrecks
-// a row, though it still rides in `-o json` and `openf1 cat`. Swap `-` for
-// `table:"body,truncate"` if you would rather clip it to the terminal width.
-type Page struct {
-	ID    string `json:"id" kit:"id" table:"id"`
-	URL   string `json:"url" table:"url,url"`
-	Title string `json:"title,omitempty" table:"title"`
-	Body  string `json:"body,omitempty" kit:"body" table:"-"`
+// buildURL constructs an API URL from an endpoint path and query params.
+func (c *Client) buildURL(path string, params url.Values) string {
+	u := c.cfg.BaseURL + "/" + path
+	if len(params) > 0 {
+		u += "?" + params.Encode()
+	}
+	return u
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// addIntParam adds a param only when v is non-zero.
+func addIntParam(params url.Values, key string, v int) {
+	if v != 0 {
+		params.Set(key, strconv.Itoa(v))
+	}
+}
+
+// addStrParam adds a param only when v is non-empty.
+func addStrParam(params url.Values, key, v string) {
+	if v != "" {
+		params.Set(key, v)
+	}
+}
+
+// --- Sessions ---
+
+// SessionFilter holds optional filter params for the sessions endpoint.
+type SessionFilter struct {
+	Year        int
+	SessionName string // "Race", "Qualifying", "Sprint", etc.
+	Circuit     string // circuit_short_name
+}
+
+// GetSessions fetches sessions matching the filter.
+func (c *Client) GetSessions(ctx context.Context, f SessionFilter) ([]Session, error) {
+	params := url.Values{}
+	addIntParam(params, "year", f.Year)
+	addStrParam(params, "session_name", f.SessionName)
+	addStrParam(params, "circuit_short_name", f.Circuit)
+	rawURL := c.buildURL("sessions", params)
+
+	body, err := c.get(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var out []Session
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode sessions: %w", err)
 	}
 	return out, nil
 }
 
-// Search fetches the site's search results for query and returns the matching
-// pages as stubs, the same shape PageLinks emits, so every hit is an addressable
-// openf1.com page URI a host can follow. Like the rest of the scaffold it is a
-// stand-in: it reads the links out of a results page rather than a real search
-// API. Point it at the real endpoint and parse the real result shape once you
-// know it.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]*Page, error) {
-	body, err := c.Get(ctx, BaseURL+"/search?q="+url.QueryEscape(query))
+// --- Meetings ---
+
+// MeetingFilter holds optional filter params for the meetings endpoint.
+type MeetingFilter struct {
+	Year int
+}
+
+// GetMeetings fetches meetings matching the filter.
+func (c *Client) GetMeetings(ctx context.Context, f MeetingFilter) ([]Meeting, error) {
+	params := url.Values{}
+	addIntParam(params, "year", f.Year)
+	rawURL := c.buildURL("meetings", params)
+
+	body, err := c.get(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var out []Meeting
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode meetings: %w", err)
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- Drivers ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// DriverFilter holds optional filter params for the drivers endpoint.
+type DriverFilter struct {
+	SessionKey   int
+	DriverNumber int
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// GetDrivers fetches drivers matching the filter.
+func (c *Client) GetDrivers(ctx context.Context, f DriverFilter) ([]Driver, error) {
+	params := url.Values{}
+	addIntParam(params, "session_key", f.SessionKey)
+	addIntParam(params, "driver_number", f.DriverNumber)
+	rawURL := c.buildURL("drivers", params)
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var out []Driver
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode drivers: %w", err)
+	}
+	return out, nil
+}
+
+// --- Laps ---
+
+// LapFilter holds optional filter params for the laps endpoint.
+type LapFilter struct {
+	SessionKey   int
+	DriverNumber int
+	LapNumber    int
+}
+
+// GetLaps fetches laps matching the filter.
+func (c *Client) GetLaps(ctx context.Context, f LapFilter) ([]Lap, error) {
+	params := url.Values{}
+	addIntParam(params, "session_key", f.SessionKey)
+	addIntParam(params, "driver_number", f.DriverNumber)
+	addIntParam(params, "lap_number", f.LapNumber)
+	rawURL := c.buildURL("laps", params)
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var out []Lap
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode laps: %w", err)
+	}
+	return out, nil
+}
+
+// --- Stints ---
+
+// StintFilter holds optional filter params for the stints endpoint.
+type StintFilter struct {
+	SessionKey   int
+	DriverNumber int
+}
+
+// GetStints fetches stints matching the filter.
+func (c *Client) GetStints(ctx context.Context, f StintFilter) ([]Stint, error) {
+	params := url.Values{}
+	addIntParam(params, "session_key", f.SessionKey)
+	addIntParam(params, "driver_number", f.DriverNumber)
+	rawURL := c.buildURL("stints", params)
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var out []Stint
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode stints: %w", err)
+	}
+	return out, nil
+}
+
+// --- Pit ---
+
+// PitFilter holds optional filter params for the pit endpoint.
+type PitFilter struct {
+	SessionKey   int
+	DriverNumber int
+}
+
+// GetPit fetches pit stops matching the filter.
+func (c *Client) GetPit(ctx context.Context, f PitFilter) ([]PitStop, error) {
+	params := url.Values{}
+	addIntParam(params, "session_key", f.SessionKey)
+	addIntParam(params, "driver_number", f.DriverNumber)
+	rawURL := c.buildURL("pit", params)
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var out []PitStop
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode pit: %w", err)
+	}
+	return out, nil
+}
+
+// --- RaceControl ---
+
+// RaceControlFilter holds optional filter params for the race_control endpoint.
+type RaceControlFilter struct {
+	SessionKey int
+	Flag       string
+}
+
+// GetRaceControl fetches race control messages matching the filter.
+func (c *Client) GetRaceControl(ctx context.Context, f RaceControlFilter) ([]RaceControlMsg, error) {
+	params := url.Values{}
+	addIntParam(params, "session_key", f.SessionKey)
+	addStrParam(params, "flag", f.Flag)
+	rawURL := c.buildURL("race_control", params)
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var out []RaceControlMsg
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode race_control: %w", err)
+	}
+	return out, nil
 }
