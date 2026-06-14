@@ -1,0 +1,10 @@
+title       = "openf1"
+baseURL     = "https://openf1-cli.tamnd.com/"
+description = "A command line for openf1."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/openf1-cli"
