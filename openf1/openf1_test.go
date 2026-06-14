@@ -189,12 +189,12 @@ func TestGetLapsNullDuration(t *testing.T) {
 	// LapDuration is null in the first lap of a race typically
 	fixture := []map[string]any{
 		{
-			"lap_number":    1,
-			"driver_number": 55,
-			"lap_duration":  nil,
-			"i1_speed":      266,
-			"i2_speed":      249,
-			"st_speed":      310,
+			"lap_number":     1,
+			"driver_number":  55,
+			"lap_duration":   nil,
+			"i1_speed":       266,
+			"i2_speed":       249,
+			"st_speed":       310,
 			"is_pit_out_lap": true,
 		},
 	}

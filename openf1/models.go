@@ -3,16 +3,16 @@ package openf1
 // Session represents one F1 session (Race, Qualifying, Sprint, etc.)
 // as returned by the /sessions endpoint.
 type Session struct {
-	SessionKey        int    `json:"session_key" kit:"id" table:"session_key"`
-	MeetingKey        int    `json:"meeting_key" table:"meeting_key"`
-	Year              int    `json:"year" table:"year"`
-	MeetingName       string `json:"meeting_name" table:"meeting_name"`
-	CountryName       string `json:"country_name" table:"country_name"`
-	CircuitShortName  string `json:"circuit_short_name" table:"circuit_short_name"`
-	SessionName       string `json:"session_name" table:"session_name"`
-	SessionType       string `json:"session_type" table:"session_type"`
-	DateStart         string `json:"date_start" table:"date_start"`
-	DateEnd           string `json:"date_end" table:"date_end"`
+	SessionKey       int    `json:"session_key" kit:"id" table:"session_key"`
+	MeetingKey       int    `json:"meeting_key" table:"meeting_key"`
+	Year             int    `json:"year" table:"year"`
+	MeetingName      string `json:"meeting_name" table:"meeting_name"`
+	CountryName      string `json:"country_name" table:"country_name"`
+	CircuitShortName string `json:"circuit_short_name" table:"circuit_short_name"`
+	SessionName      string `json:"session_name" table:"session_name"`
+	SessionType      string `json:"session_type" table:"session_type"`
+	DateStart        string `json:"date_start" table:"date_start"`
+	DateEnd          string `json:"date_end" table:"date_end"`
 }
 
 // Meeting represents one F1 race weekend as returned by the /meetings endpoint.
@@ -51,12 +51,12 @@ type Lap struct {
 
 // Stint represents one tyre stint as returned by /stints.
 type Stint struct {
-	StintNumber     int    `json:"stint_number" kit:"id" table:"stint_number"`
-	DriverNumber    int    `json:"driver_number" table:"driver_number"`
-	LapStart        int    `json:"lap_start" table:"lap_start"`
-	LapEnd          int    `json:"lap_end" table:"lap_end"`
-	Compound        string `json:"compound" table:"compound"`
-	TyreAgeAtStart  int    `json:"tyre_age_at_start" table:"tyre_age"`
+	StintNumber    int    `json:"stint_number" kit:"id" table:"stint_number"`
+	DriverNumber   int    `json:"driver_number" table:"driver_number"`
+	LapStart       int    `json:"lap_start" table:"lap_start"`
+	LapEnd         int    `json:"lap_end" table:"lap_end"`
+	Compound       string `json:"compound" table:"compound"`
+	TyreAgeAtStart int    `json:"tyre_age_at_start" table:"tyre_age"`
 }
 
 // PitStop represents one pit stop event as returned by /pit.
